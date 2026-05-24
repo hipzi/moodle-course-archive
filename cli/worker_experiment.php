@@ -1,7 +1,7 @@
 <?php
 define('CLI_SCRIPT', true);
 
-require(__DIR__ . '/../../../config.php');
+require(__DIR__ . '/../../../../config.php');
 require(__DIR__ . '/../vendor/autoload.php');
 
 use PhpAmqpLib\Connection\AMQPStreamConnection;
@@ -89,7 +89,7 @@ $callback = function (AMQPMessage $msg) use ($queue, $channel, $exchange, $routi
 
     echo "[EXP] jobid={$jobid} courseid={$courseid} userid={$userid} retries={$retries}\n";
 
-    $dirroot = realpath(__DIR__ . '/../../../../');
+    $dirroot = realpath(__DIR__ . '/../../../../../');
 
     $archivebase = $CFG->dataroot . "/archive";
     if (!is_dir($archivebase)) {
@@ -116,7 +116,7 @@ $callback = function (AMQPMessage $msg) use ($queue, $channel, $exchange, $routi
         ? (int)$job->timecreated_ms
         : (int) round(microtime(true) * 1000);
 
-    $cmd = "php {$dirroot}/admin/cli/backup.php --courseid={$courseid} --destination=\"{$dest}\" 2>&1";
+    $cmd = "php8.2 {$dirroot}/admin/cli/backup.php --courseid={$courseid} --destination=\"{$dest}\" 2>&1";
     echo "[EXP] Running backup command:\n{$cmd}\n";
 
     $output = [];
