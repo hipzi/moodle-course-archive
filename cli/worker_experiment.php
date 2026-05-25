@@ -89,7 +89,7 @@ $callback = function (AMQPMessage $msg) use ($queue, $channel, $exchange, $routi
 
     echo "[EXP] jobid={$jobid} courseid={$courseid} userid={$userid} retries={$retries}\n";
 
-    $dirroot = realpath(__DIR__ . '/../../../../../');
+    $dirroot = realpath(__DIR__ . '/../../../../');
 
     $archivebase = $CFG->dataroot . "/archive";
     if (!is_dir($archivebase)) {
