@@ -1,212 +1,433 @@
 <?php
+
 define('CLI_SCRIPT', true);
 
 require(__DIR__ . '/../../../../config.php');
-require(__DIR__ . '/../vendor/autoload.php');
+require_once(__DIR__ . '/../vendor/autoload.php');
 
-use PhpAmqpLib\Connection\AMQPStreamConnection;
+use local_archive\experiment\queue_topology;
+use local_archive\experiment\rabbitmq_connection;
+
 use PhpAmqpLib\Message\AMQPMessage;
 
-$queue = $argv[1] ?? null;
+$queue =
+    trim((string) getenv('QUEUE_NAME'));
 
-if (!$queue) {
-    echo "Usage: php worker_experiment.php <queue>\n";
-    echo "Example: php worker_experiment.php archive.single\n";
-    exit(1);
+$workerid =
+    trim((string) getenv('WORKER_ID'));
+
+if ($queue === '') {
+    throw new RuntimeException(
+        'QUEUE_NAME is required.'
+    );
 }
 
-$exchange = 'archive.direct';
+if ($workerid === '') {
+    throw new RuntimeException(
+        'WORKER_ID is required.'
+    );
+}
 
-$routingkey = match ($queue) {
-    'archive.small'  => 'backup.course.small',
-    'archive.medium' => 'backup.course.medium',
-    'archive.large'  => 'backup.course.large',
-    'archive.single' => 'backup.course.single',
-    default          => $queue,
-};
+if (!queue_topology::is_worker_queue($queue)) {
+    throw new RuntimeException(
+        'Invalid experiment queue: '
+        . $queue
+    );
+}
 
-echo "[EXP] Starting worker for queue={$queue} (exchange={$exchange}, routing={$routingkey})\n";
-
-$rabbithost = getenv('RABBITMQ_HOST') ?: '127.0.0.1';
-$rabbitport = (int)(getenv('RABBITMQ_PORT') ?: 5672);
-$rabbituser = getenv('RABBITMQ_USER') ?: 'guest';
-$rabbitpass = getenv('RABBITMQ_PASSWORD') ?: 'guest';
-$rabbitvhost = getenv('RABBITMQ_VHOST') ?: '/';
-
-$connection = new AMQPStreamConnection(
-    $rabbithost,
-    $rabbitport,
-    $rabbituser,
-    $rabbitpass,
-    $rabbitvhost
+echo sprintf(
+    "[WORKER] id=%s queue=%s\n",
+    $workerid,
+    $queue
 );
 
-$channel = $connection->channel();
+$connection =
+    rabbitmq_connection::create();
 
-$channel->exchange_declare($exchange, 'direct', false, true, false);
+$channel =
+    $connection->channel();
 
-$channel->queue_declare($queue, false, true, false, false);
-$channel->queue_bind($queue, $exchange, $routingkey);
+queue_topology::declare(
+    $channel
+);
 
-$channel->queue_declare('archive.dead', false, true, false, false);
-$channel->queue_bind('archive.dead', $exchange, 'backup.course.dead');
+$channel->basic_qos(
+    null,
+    1,
+    null
+);
 
-$channel->basic_qos(null, 1, null);
-
-function archive_update_job(string $jobid, array $fields): void {
+function experiment_update_job(
+    string $jobid,
+    array $fields
+): void {
     global $DB;
 
-    $job = $DB->get_record('local_archive_job', ['jobid' => $jobid], '*', IGNORE_MISSING);
-    if (!$job) {
-        return;
-    }
+    $job = $DB->get_record(
+        'local_archive_job',
+        ['jobid' => $jobid],
+        '*',
+        MUST_EXIST
+    );
 
-    foreach ($fields as $k => $v) {
-        $job->$k = $v;
+    foreach ($fields as $field => $value) {
+        $job->$field = $value;
     }
 
     $job->timemodified = time();
 
-    if (!array_key_exists('timemodified_ms', $fields)) {
-        $job->timemodified_ms = (int) round(microtime(true) * 1000);
+    if (
+        !array_key_exists(
+            'timemodified_ms',
+            $fields
+        )
+    ) {
+        $job->timemodified_ms =
+            (int) round(
+                microtime(true) * 1000
+            );
     }
 
-    $DB->update_record('local_archive_job', $job);
+    $DB->update_record(
+        'local_archive_job',
+        $job
+    );
 }
 
-$callback = function (AMQPMessage $msg) use ($queue, $channel, $exchange, $routingkey) {
+$callback = function(
+    AMQPMessage $msg
+) use (
+    $queue,
+    $workerid,
+    $channel
+) {
     global $CFG, $DB;
 
-    echo "----\n";
-    echo "[EXP] Received message from {$queue}\n";
+    echo PHP_EOL;
+    echo "----------------------------------------" . PHP_EOL;
+    echo "[WORKER] Received message from $queue" . PHP_EOL;
 
-    $data = json_decode($msg->body, true) ?: [];
-
-    $jobid    = $data['jobid']    ?? '(no-jobid)';
-    $courseid = (int)($data['courseid'] ?? 0);
-    $userid   = (int)($data['userid'] ?? 0);
-    $retries  = (int)($data['retries'] ?? 0);
-
-    echo "[EXP] jobid={$jobid} courseid={$courseid} userid={$userid} retries={$retries}\n";
-
-    $dirroot = realpath(__DIR__ . '/../../../../');
-
-    $archivebase = $CFG->dataroot . "/archive";
-    if (!is_dir($archivebase)) {
-        mkdir($archivebase, 0777, true);
-    }
-
-    $courseDir = "{$archivebase}/{$courseid}";
-    if (!is_dir($courseDir)) {
-        mkdir($courseDir, 0777, true);
-    }
-
-    $dest = "{$courseDir}/{$jobid}";
-    if (!is_dir($dest)) {
-        mkdir($dest, 0777, true);
-    }
-
-    archive_update_job($jobid, [
-        'status'          => 'running',
-        'timemodified_ms' => (int) round(microtime(true) * 1000),
-    ]);
-
-    $job = $DB->get_record('local_archive_job', ['jobid' => $jobid], 'timecreated_ms', IGNORE_MISSING);
-    $queued_ms = ($job && !empty($job->timecreated_ms))
-        ? (int)$job->timecreated_ms
-        : (int) round(microtime(true) * 1000);
-
-    $cmd = "php8.2 {$dirroot}/admin/cli/backup.php --courseid={$courseid} --destination=\"{$dest}\" 2>&1";
-    echo "[EXP] Running backup command:\n{$cmd}\n";
-
-    $output = [];
-    $return = 0;
-
-    $serviceStart = microtime(true);
-    exec($cmd, $output, $return);
-    $serviceDuration = round(microtime(true) - $serviceStart, 3);
-
-    echo "[EXP] Return code: {$return}\n";
-    echo "[EXP] Output:\n" . implode("\n", $output) . "\n";
-
-    if ($return === 0) {
-        $mbzpath = null;
-        foreach (glob($dest . '/*.mbz') as $f) {
-            $mbzpath = $f;
-            break;
-        }
-
-        $finished_ms   = (int) round(microtime(true) * 1000);
-        $totalDuration = round(($finished_ms - $queued_ms) / 1000, 3);
-
-        $fields = [
-            'status'          => 'success',
-            'duration_sec'    => $serviceDuration,
-            'total_sec'       => $totalDuration,
-            'timemodified_ms' => $finished_ms,
-        ];
-
-        if ($mbzpath && is_readable($mbzpath)) {
-            $fields['mbz_size_mb'] = round(filesize($mbzpath) / (1024 * 1024), 2);
-            $fields['filepath']    = $mbzpath;
-        }
-
-        archive_update_job($jobid, $fields);
-
-        $DB->execute(
-            "UPDATE {local_archive_job}
-                SET status = :status,
-                    duration_sec = :duration_sec,
-                    total_sec = :total_sec,
-                    timemodified_ms = :timemodified_ms
-            WHERE jobid = :jobid",
-            [
-                'status'          => 'success',
-                'duration_sec'    => $serviceDuration,
-                'total_sec'       => $totalDuration,
-                'timemodified_ms' => $finished_ms,
-                'jobid'           => $jobid,
-            ]
+    try {
+        $data = json_decode(
+            $msg->getBody(),
+            true,
+            512,
+            JSON_THROW_ON_ERROR
         );
+    } catch (\JsonException $e) {
+        echo "[WORKER] Invalid JSON" . PHP_EOL;
 
-        echo "[EXP] SUCCESS job={$jobid} duration={$serviceDuration}s total={$totalDuration}s dest={$dest}\n";
-        $msg->ack();
-        echo "----\n";
+        $msg->reject(false);
         return;
     }
 
-    echo "[EXP] FAILED job={$jobid} course={$courseid}\n";
+    $jobid =
+        (string) ($data['jobid'] ?? '');
 
-    if ($retries < 3) {
-        $data['retries'] = $retries + 1;
+    $courseid =
+        (int) ($data['courseid'] ?? 0);
 
-        archive_update_job($jobid, [
-            'status'  => 'retry',
-            'retries' => $data['retries'],
-        ]);
+    $userid =
+        (int) ($data['userid'] ?? 0);
 
-        $retryMsg = new AMQPMessage(json_encode($data), $msg->get_properties());
-        $channel->basic_publish($retryMsg, $exchange, $routingkey);
+    if (
+        $jobid === ''
+        || $courseid <= 0
+        || $userid <= 0
+    ) {
+        echo "[WORKER] Invalid payload" . PHP_EOL;
 
-        echo "[EXP] Requeued job={$jobid} retries={$data['retries']} rk={$routingkey}\n";
-    } else {
-        $data['failed_at'] = time();
-
-        archive_update_job($jobid, [
-            'status' => 'failed',
-        ]);
-
-        $deadMsg = new AMQPMessage(json_encode($data), $msg->get_properties());
-        $channel->basic_publish($deadMsg, $exchange, 'backup.course.dead');
-
-        echo "[EXP] Moved job={$jobid} to archive.dead after {$retries} retries\n";
+        $msg->reject(false);
+        return;
     }
 
+    $job = $DB->get_record(
+        'local_archive_job',
+        ['jobid' => $jobid],
+        '*',
+        IGNORE_MISSING
+    );
+
+    if (!$job) {
+        echo "[WORKER] DB job not found: $jobid" . PHP_EOL;
+
+        $msg->reject(false);
+        return;
+    }
+
+    // Simple duplicate protection.
+    if ($job->status === 'success') {
+        echo "[WORKER] Job already completed: $jobid" . PHP_EOL;
+
+        $msg->ack();
+        return;
+    }
+
+    $startedms =
+        (int) round(
+            microtime(true) * 1000
+        );
+
+    experiment_update_job(
+        $jobid,
+        [
+            'status' => 'running',
+
+            'startedat_ms' =>
+                $startedms,
+
+            'workerid' =>
+                $workerid,
+
+            'timemodified_ms' =>
+                $startedms,
+        ]
+    );
+
+    echo sprintf(
+        "[WORKER] job=%s course=%d worker=%s\n",
+        $jobid,
+        $courseid,
+        $workerid
+    );
+
+    $archivebase =
+        $CFG->dataroot . '/archive';
+
+    if (!is_dir($archivebase)) {
+        mkdir(
+            $archivebase,
+            0770,
+            true
+        );
+    }
+
+    $coursedir =
+        $archivebase . '/'
+        . $courseid;
+
+    if (!is_dir($coursedir)) {
+        mkdir(
+            $coursedir,
+            0770,
+            true
+        );
+    }
+
+    $dest =
+        $coursedir . '/'
+        . $jobid;
+
+    if (!is_dir($dest)) {
+        mkdir(
+            $dest,
+            0770,
+            true
+        );
+    }
+
+    // Same Moodle backup mechanism as the existing experiment worker.
+    $dirroot =
+        realpath(
+            __DIR__ . '/../../../../'
+        );
+
+    if ($dirroot === false) {
+        throw new RuntimeException(
+            'Unable to resolve Moodle root.'
+        );
+    }
+
+    $backupscript =
+        $dirroot
+        . '/admin/cli/backup.php';
+
+    $cmd =
+        escapeshellarg(PHP_BINARY)
+        . ' '
+        . escapeshellarg($backupscript)
+        . ' --courseid='
+        . $courseid
+        . ' --destination='
+        . escapeshellarg($dest)
+        . ' 2>&1';
+
+    echo "[WORKER] Starting Moodle backup" . PHP_EOL;
+
+    $output = [];
+    $returncode = 0;
+
+    $servicestart =
+        microtime(true);
+
+    exec(
+        $cmd,
+        $output,
+        $returncode
+    );
+
+    $serviceend =
+        microtime(true);
+
+    $duration =
+        round(
+            $serviceend - $servicestart,
+            3
+        );
+
+    $completedms =
+        (int) round(
+            $serviceend * 1000
+        );
+
+    $releasedms =
+        !empty($job->releasedat_ms)
+            ? (int) $job->releasedat_ms
+            : (int) $job->timecreated_ms;
+
+    $totalsec =
+        round(
+            (
+                $completedms
+                - $releasedms
+            ) / 1000,
+            3
+        );
+
+    if ($returncode === 0) {
+
+        $mbzpath = null;
+
+        foreach (
+            glob($dest . '/*.mbz')
+            as $file
+        ) {
+            $mbzpath = $file;
+            break;
+        }
+
+        $fields = [
+            'status' =>
+                'success',
+
+            'duration_sec' =>
+                $duration,
+
+            'total_sec' =>
+                $totalsec,
+
+            'completedat_ms' =>
+                $completedms,
+
+            'timemodified_ms' =>
+                $completedms,
+        ];
+
+        if (
+            $mbzpath
+            && is_readable($mbzpath)
+        ) {
+            $fields['mbz_size_mb'] =
+                round(
+                    filesize($mbzpath)
+                    / (1024 * 1024),
+                    2
+                );
+
+            $fields['filepath'] =
+                $mbzpath;
+        }
+
+        experiment_update_job(
+            $jobid,
+            $fields
+        );
+
+        echo sprintf(
+            "[WORKER] SUCCESS job=%s duration=%.3fs total=%.3fs\n",
+            $jobid,
+            $duration,
+            $totalsec
+        );
+
+        $msg->ack();
+
+        return;
+    }
+
+    echo sprintf(
+        "[WORKER] FAILED job=%s return=%d\n",
+        $jobid,
+        $returncode
+    );
+
+    experiment_update_job(
+        $jobid,
+        [
+            'status' =>
+                'failed',
+
+            'retries' =>
+                ((int) $job->retries) + 1,
+
+            'duration_sec' =>
+                $duration,
+
+            'total_sec' =>
+                $totalsec,
+
+            'completedat_ms' =>
+                $completedms,
+
+            'timemodified_ms' =>
+                $completedms,
+        ]
+    );
+
+    // Failed experiment jobs go to a separate DLQ.
+    // They are not automatically retried because a failed
+    // measured run should be rerun as a complete attempt.
+    $data['failed_at_ms'] =
+        $completedms;
+
+    $deadmessage =
+        new AMQPMessage(
+            json_encode(
+                $data,
+                JSON_THROW_ON_ERROR
+            ),
+            [
+                'content_type' =>
+                    'application/json',
+
+                'delivery_mode' =>
+                    AMQPMessage::DELIVERY_MODE_PERSISTENT,
+
+                'message_id' =>
+                    $jobid,
+            ]
+        );
+
+    $channel->basic_publish(
+        $deadmessage,
+        queue_topology::EXCHANGE,
+        'experiment.dead'
+    );
+
     $msg->ack();
-    echo "----\n";
 };
 
-$channel->basic_consume($queue, '', false, false, false, false, $callback);
+$channel->basic_consume(
+    $queue,
+    '',
+    false,
+    false,
+    false,
+    false,
+    $callback
+);
+
+echo "[WORKER] Waiting for messages..." . PHP_EOL;
 
 while ($channel->is_open()) {
     $channel->wait();
